@@ -7,12 +7,13 @@ from langchain.prompts import ChatPromptTemplate
 from langchain.schema.runnable import RunnablePassthrough
 from langchain_google_genai import ChatGoogleGenerativeAI
 from deep_translator import GoogleTranslator
-from langdetect import detect
+from langdetect import detect_langs
 import re
 import sweetviz as sv
 from streamlit.components.v1 import html
 import io
 import numpy as np
+import time
 
 if not hasattr(pd.DataFrame, 'iteritems'):
     pd.DataFrame.iteritems = pd.DataFrame.items
@@ -296,21 +297,49 @@ def process_prompt(prompt, data):
     if data is None:
         return "Please upload a valid CSV, JSON or XLSX."
     # Detect language
-    detected_lang = detect(prompt)
+    lang_probs = detect_langs(prompt)
+    detected_lang = lang_probs[0].lang  # Most probable language
+    confidence = lang_probs[0].prob    # Confidence score
     
+    # Consider it English if short and ambiguous or high confidence for 'en'
+    is_english_input = detected_lang == 'en' or (len(prompt.split()) < 5 and confidence < 0.9)
+
     # Translate prompt to English if necessary
     try:
         # Translate prompt to English for processing (since the model works in English)
-        translated_prompt = GoogleTranslator(source=detected_lang, target='en').translate(prompt) if detected_lang != 'en' else prompt
+        translated_prompt = prompt if is_english_input else GoogleTranslator(source=detected_lang, target='en').translate(prompt)
 
         # Initialize Gemini API
-        llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=st.secrets["GEMINI_API_KEY"])
+        llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=st.secrets["GEMINI_API_KEY"],temperature=0.3,max_output_tokens=1000)
 
-        # Create a ChatPromptTemplate
+        if isinstance(data, pd.DataFrame):
+            # Summary stats for numeric columns
+            summary_stats = data.describe().to_string()
+            categorical_cols = data.select_dtypes(include=['object', 'category']).columns
+            cat_summary = {col: data[col].value_counts().head(1000).to_string() for col in categorical_cols}
+            cat_summary_str = "\n".join(f"{col}:\n{counts}" for col, counts in cat_summary.items())
+            # Combine into a concise data summary
+            data_summary = (
+                f"Dataset Overview:\n"
+                f"- Rows: {len(data)}\n"
+                f"- Columns: {len(data.columns)}\n"
+                f"Numeric Summary:\n{summary_stats}\n"
+                f"Categorical Summary:\n{cat_summary_str if cat_summary_str else 'None'}"
+            )
+        else:
+            data_summary = str(data)  # Fallback for non-DataFrame data
+
+        # Prompt template with explicit English output instruction
         prompt_template = ChatPromptTemplate.from_template(
-            "You are a data analyst. Analyze the following data and answer the user's question:\n\n"
-            "Data:\n{data}\n\n"
-            "Question: {question}"
+            st.session_state.get('custom_prompt', (
+                "You are a skilled data analyst. Analyze the entire dataset based on this summary:\n\n"
+                "Data Summary:\n{data}\n\n"
+                "Answer the user's question accurately and concisely in English:\n{question}\n\n"
+                "Examples:\n"
+                "- Q: What’s the mean of column X? A: The mean of X is Y.\n"
+                "- Q: How many unique values in column Z? A: Column Z has N unique values.\n"
+                "If the question is unclear or requires specific data not in the summary, ask for clarification in English."
+            ))
         )
 
         # Use the custom prompt from session state
@@ -318,17 +347,14 @@ def process_prompt(prompt, data):
 
         # Create an LLMChain
         chain = prompt_template | llm | RunnablePassthrough()
-        response = chain.invoke({"data": data.head().to_string() if isinstance(data, pd.DataFrame) else data, "question": translated_prompt})
+        response = chain.invoke({"data": data_summary if isinstance(data, pd.DataFrame) else data, "question": translated_prompt})
         response_text = response.content if hasattr(response, "content") else str(response)  # Extract text
         #return response_text
-
-        cleaned_response = re.sub(r'[^0-9a-zA-Z\s.,]', '', response_text)
         # Translate response back to original language
         #translated_response = translator.translate(response_text, src='en', dest=detected_lang).text
         #return translated_response
-        final_response = (GoogleTranslator(source='en', target=detected_lang).translate(response_text) 
-                         if detected_lang != 'en' else response_text)
-        return final_response
+        final_response = response_text if is_english_input else GoogleTranslator(source='en', target=detected_lang).translate(response_text)
+        return final_response or "No meaningful response generated."
         #final_response = ''.join(c for c in translated_response if ord(c) >= 0x0B80 and ord(c) <= 0x0BFF or c.isspace() or c in '.,0123456789')
 
         # Translate back only if the original input was not in English
@@ -342,20 +368,20 @@ def process_prompt(prompt, data):
 # Chat interface
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        st.markdown(f"{message['content']} *({message['timestamp']})*")
 
-# Chat input
+# Chat input with timestamp
 if prompt := st.chat_input("Ask a question about the data"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state.messages.append({"role": "user", "content": prompt, "timestamp": timestamp})
     with st.chat_message("user"):
-        st.markdown(prompt)
-
-    # Process the prompt and generate a response
+        st.markdown(f"{prompt} *({timestamp})*")
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             response = process_prompt(prompt, st.session_state.data)
-            st.markdown(response)
-            st.session_state.messages.append({"role": "assistant", "content": response})
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            st.markdown(f"{response} *({timestamp})*")
+            st.session_state.messages.append({"role": "assistant", "content": response, "timestamp": timestamp})
 
 # Sidebar options
 if st.sidebar.button("Clear Chat History"):
@@ -379,13 +405,12 @@ if st.sidebar.button("Show Summary Statistics"):
     if isinstance(st.session_state.data, pd.DataFrame):
         st.write(st.session_state.data.describe())
     else:
-        st.write("Summary statistics are only available for tabular data (CSV, Excel).")
-
+        st.write("Summary statistics are only available for tabular data.")
 if st.sidebar.button("Detect Missing Values"):
     if isinstance(st.session_state.data, pd.DataFrame):
         st.write(st.session_state.data.isnull().sum())
     else:
-        st.write("Missing value detection is only available for tabular data (CSV, Excel).")
+        st.write("Missing value detection only for tabular data.")
 
 # Data Visualization in Sidebar under Predefined Queries
 if isinstance(st.session_state.data, pd.DataFrame):
@@ -393,9 +418,9 @@ if isinstance(st.session_state.data, pd.DataFrame):
     chart_type = st.sidebar.selectbox("Select chart type", ["Histogram", "Bar", "Scatter"])
     numeric_columns = st.session_state.data.select_dtypes(include=['number']).columns
     if numeric_columns.empty:
-        st.sidebar.write("No numeric columns available for visualization.")
+        st.sidebar.write("No numeric columns available.")
     else:
-        column_to_visualize = st.sidebar.selectbox("Select a column to visualize", numeric_columns, key="column_select")
+        column_to_visualize = st.sidebar.selectbox("Select a column", numeric_columns, key="column_select")
         if st.sidebar.button("Generate Visualization"):
             st.session_state.show_visualization = True
             st.session_state.chart_type = chart_type
@@ -407,18 +432,13 @@ if isinstance(st.session_state.data, pd.DataFrame):
     if st.sidebar.button("Generate EDA Report"):
         with st.spinner("Generating EDA report..."):
             try:
-                # Preprocess data: reset index and ensure 'index' column
-                data_for_report = st.session_state.data.copy()  # Avoid modifying original data
+                data_for_report = st.session_state.data.copy()
                 if data_for_report.index.name is not None:
                     data_for_report = data_for_report.reset_index().rename(columns={data_for_report.index.name: 'index'})
                 else:
                     data_for_report = data_for_report.reset_index()
-                
-                # Ensure all columns are properly named and index is set
                 if 'index' not in data_for_report.columns:
                     data_for_report = data_for_report.rename(columns={data_for_report.columns[0]: 'index'})
-                
-                # Generate the report
                 report = sv.analyze(data_for_report)
                 report_file = "eda_report.html"
                 report.show_html(report_file, open_browser=False)
@@ -432,13 +452,15 @@ if st.session_state.show_visualization and isinstance(st.session_state.data, pd.
     data = st.session_state.data.reset_index()
     chart_type = st.session_state.chart_type
     column = st.session_state.column_to_visualize
-    
     if chart_type == "Histogram":
         fig = px.histogram(data, x=column, title=f"Histogram of {column}")
     elif chart_type == "Bar":
-        fig = px.bar(data, x=data.index, y=column, title=f"Bar Chart of {column}")
+        fig = px.bar(data, x='index', y=column, title=f"Bar Chart of {column}")
     elif chart_type == "Scatter":
-        fig = px.scatter(data, x=data.index, y=column, title=f"Scatter Plot of {column}")
+        fig = px.scatter(data, x='index', y=column, title=f"Scatter Plot of {column}")
+    st.markdown('<div class="center-plotly">', unsafe_allow_html=True)
+    st.plotly_chart(fig)
+    st.markdown('</div>', unsafe_allow_html=True)
     
     # Center the chart using CSS
     st.markdown('<div class="center-plotly">', unsafe_allow_html=True)
