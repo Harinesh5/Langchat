@@ -461,11 +461,6 @@ if st.session_state.show_visualization and isinstance(st.session_state.data, pd.
     st.markdown('<div class="center-plotly">', unsafe_allow_html=True)
     st.plotly_chart(fig)
     st.markdown('</div>', unsafe_allow_html=True)
-    
-    # Center the chart using CSS
-    st.markdown('<div class="center-plotly">', unsafe_allow_html=True)
-    st.plotly_chart(fig)
-    st.markdown('</div>', unsafe_allow_html=True)
 
 # Display EDA report in main body if triggered
 if st.session_state.show_eda_report and isinstance(st.session_state.data, pd.DataFrame):
